@@ -5,6 +5,8 @@ import argparse, time, math
 import numpy as np
 from functools import wraps
 import tqdm
+import pymetis
+import torch
 
 import dgl
 from dgl import DGLGraph
@@ -21,41 +23,64 @@ import torch.optim as optim
 import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 
+import json
+import numpy as np
+import new_sampling_function
+import partition_graph
+from collections import defaultdict
+
 def load_subtensor(g, seeds, input_nodes, device, load_feat=True):
     """
     Copys features and labels of a set of nodes onto GPU.
     """
-    batch_inputs = g.ndata['features'][input_nodes].to(device) if load_feat else None
-    batch_labels = g.ndata['labels'][seeds].to(device)
+    # batch_inputs = g.ndata['features'][input_nodes].to(device) if load_feat else None
+    # batch_labels = g.ndata['labels'][seeds].to(device)
+
+    batch_inputs = g.ndata['feat'][input_nodes].to(device) if load_feat else None
+    batch_labels = g.ndata['label'][seeds].to(device)
+
     return batch_inputs, batch_labels
 
 class NeighborSampler(object):
-    def __init__(self, g, fanouts, sample_neighbors, device, load_feat=True):
+    def __init__(self, g, fanouts, partition_data, partition_sets, adjncy, xadj, sample_neighbors, device, load_feat=True):
         self.g = g
         self.fanouts = fanouts
+        self.partition_data = partition_data
         self.sample_neighbors = sample_neighbors
         self.device = device
         self.load_feat=load_feat
+        self.adjncy = adjncy
+        self.xadj = xadj
+        self.partition_sets = partition_sets
 
     def sample_blocks(self, seeds):
         seeds = th.LongTensor(np.asarray(seeds))
+        print("seed", seeds)
         blocks = []
         for fanout in self.fanouts:
             # For each seed node, sample ``fanout`` neighbors.
-            frontier = self.sample_neighbors(self.g, seeds, fanout, replace=True)
+            # frontier = self.sample_neighbors(self.g, seeds, fanout, replace=True)
+            frontier = new_sampling_function.sampling_function(self.g, 10, 5, self.partition_sets, self.xadj, self.adjncy, sample_count=5)
+            print("frontier", frontier)
+            # print("seeds", seeds)
             # Then we compact the frontier into a bipartite graph for message passing.
-            block = dgl.to_block(frontier, seeds)
+            # block = dgl.to_block(frontier, seeds)
+            block =dgl.to_block(frontier, torch.LongTensor(list(range(34))))
+            # block = dgl.to_block(frontier, dst_nodes=None, include_dst_in_src=True)
             # Obtain the seed nodes for next layer.
             seeds = block.srcdata[dgl.NID]
-
             blocks.insert(0, block)
 
         input_nodes = blocks[0].srcdata[dgl.NID]
         seeds = blocks[-1].dstdata[dgl.NID]
         batch_inputs, batch_labels = load_subtensor(self.g, seeds, input_nodes, "cpu", self.load_feat)
+
         if self.load_feat:
             blocks[0].srcdata['features'] = batch_inputs
         blocks[-1].dstdata['labels'] = batch_labels
+        print("batch_inputs", batch_inputs)
+        print("batch_labels", batch_labels)
+        print("blocks", blocks)
         return blocks
 
 class DistSAGE(nn.Module):
@@ -66,6 +91,8 @@ class DistSAGE(nn.Module):
         self.n_hidden = n_hidden
         self.n_classes = n_classes
         self.layers = nn.ModuleList()
+        print("in_feats", in_feats)
+        print("n_hidden",n_hidden)
         self.layers.append(dglnn.SAGEConv(in_feats, n_hidden, 'mean'))
         for i in range(1, n_layers - 1):
             self.layers.append(dglnn.SAGEConv(n_hidden, n_hidden, 'mean'))
@@ -76,7 +103,9 @@ class DistSAGE(nn.Module):
     def forward(self, blocks, x):
         h = x
         for l, (layer, block) in enumerate(zip(self.layers, blocks)):
-            h = layer(block, h)
+            print("layer", layer)
+            print("h",h)
+            h = layer(block, h.float())
             if l != len(self.layers) - 1:
                 h = self.activation(h)
                 h = self.dropout(h)
@@ -184,11 +213,21 @@ def pad_data(nids, device):
 def run(args, device, data):
     # Unpack data
     train_nid, val_nid, test_nid, in_feats, n_classes, g = data
-    train_nid = pad_data(train_nid, device)
+    shuffle = True
+    if args.pad_data:
+        train_nid = pad_data(train_nid, device)
+        # Current pipeline doesn't support duplicate node id within the same batch
+        # Therefore turn off shuffling to avoid potential duplicate node id within the same batch
+        shuffle = False
+    # train_nid = pad_data(train_nid, device)
     # Create sampler
-    sampler = NeighborSampler(g, [int(fanout) for fanout in args.fan_out.split(',')],
-                              dgl.distributed.sample_neighbors, device)
-
+    # sampler = NeighborSampler(g, [int(fanout) for fanout in args.fan_out.split(',')],
+    #                           dgl.distributed.sample_neighbors, device)
+    
+    # sampler = NeighborSampler(g, [int(fanout) for fanout in args.fan_out.split(',')],
+    #                           args.partition_data, args.partition_sets, args.adjncy, args.xadj, dgl.distributed.sample_neighbors, device)
+    sampler = NeighborSampler(g, [int(fanout) for fanout in args.fan_out.split(',')], args.partition_data, args.partition_sets, args.adjncy, args.xadj,
+                              new_sampling_function.sampling_function, device)
     # Create DataLoader for constructing blocks
     dataloader = DistDataLoader(
         dataset=train_nid.numpy(),
@@ -196,7 +235,7 @@ def run(args, device, data):
         collate_fn=sampler.sample_blocks,
         shuffle=True,
         drop_last=False)
-
+    print("dataloader", dataloader)
     # Define model and optimizer
     model = DistSAGE(in_feats, args.num_hidden, n_classes, args.num_layers, F.relu, args.dropout)
     model = model.to(device)
@@ -209,9 +248,8 @@ def run(args, device, data):
     loss_fcn = nn.CrossEntropyLoss()
     loss_fcn = loss_fcn.to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-
     train_size = th.sum(g.ndata['train_mask'][0:g.number_of_nodes()])
-
+    
     # Training loop
     iter_tput = []
     epoch = 0
@@ -244,6 +282,7 @@ def run(args, device, data):
             batch_labels = batch_labels.to(device)
             # Compute loss and prediction
             start = time.time()
+
             batch_pred = model(blocks, batch_inputs)
             loss = loss_fcn(batch_pred, batch_labels)
             forward_end = time.time()
@@ -285,6 +324,7 @@ def main(args):
         th.distributed.init_process_group(backend=args.backend)
     g = dgl.distributed.DistGraph(args.graph_name, part_config=args.part_config)
     print('rank:', g.rank())
+    # train_mask = torch.zeros(y.size(0), dtype=torch.bool)
 
     pb = g.get_partition_book()
     if 'trainer_id' in g.ndata:
@@ -307,13 +347,15 @@ def main(args):
         device = th.device('cpu')
     else:
         device = th.device('cuda:'+str(args.local_rank))
-    labels = g.ndata['labels'][np.arange(g.number_of_nodes())]
+    # labels = g.ndata['labels'][np.arange(g.number_of_nodes())]
+    labels = g.ndata['label'][np.arange(g.number_of_nodes())]
     n_classes = len(th.unique(labels[th.logical_not(th.isnan(labels))]))
     print('#labels:', n_classes)
 
     # Pack data
-    in_feats = g.ndata['features'].shape[1]
-    data = train_nid, val_nid, test_nid, in_feats, n_classes, g
+    in_feats = g.ndata['feat'].shape[0]
+    # in_feats = g.ndata['features'].shape[1]
+    data = train_nid, val_nid, test_nid, in_feats, n_classes, g    
     run(args, device, data)
     print("parent ends")
 
@@ -331,7 +373,7 @@ if __name__ == '__main__':
                         help="the number of GPU device. Use -1 for CPU training")
     parser.add_argument('--num_epochs', type=int, default=20)
     parser.add_argument('--num_hidden', type=int, default=16)
-    parser.add_argument('--num_layers', type=int, default=2)
+    parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--fan_out', type=str, default='10,25')
     parser.add_argument('--batch_size', type=int, default=1000)
     parser.add_argument('--batch_size_eval', type=int, default=100000)
@@ -341,7 +383,21 @@ if __name__ == '__main__':
     parser.add_argument('--dropout', type=float, default=0.5)
     parser.add_argument('--local_rank', type=int, help='get rank of the process')
     parser.add_argument('--standalone', action='store_true', help='run in the standalone mode')
+    parser.add_argument('--pad-data', default=False, action='store_true',
+                        help='Pad train nid to the same length across machine, to ensure num of batches to be the same.')
+    parser.add_argument('--graph_metadata_path', type=str, default='graph_metadata')
+    parser.add_argument('--output', type=str, default='data',
+                           help='Output path of partitioned graph.')
+    args = parser.parse_args()
+    graph_metadata_file  = open('{}/{}.json'.format(args.output, args.graph_metadata_path))
+    graph_metadata = json.load(graph_metadata_file)
+    
+    parser.add_argument('--xadj', type=str, default=graph_metadata['xadj'])
+    parser.add_argument('--adjncy', type=str, default=graph_metadata['adjncy'])
+    parser.add_argument('--partition_data', type=str, default=np.array(graph_metadata['partition_data']))
+    parser.add_argument('--partition_sets', type=str, default=[set(np.array(x)) for x in graph_metadata['partition_sets']])
+    
     args = parser.parse_args()
 
-    print(args)
+    # print(args)
     main(args)
